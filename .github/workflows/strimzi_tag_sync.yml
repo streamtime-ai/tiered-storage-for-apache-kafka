@@ -75,8 +75,10 @@ jobs:
           import email.utils
           import json
           import os
+          import re
           import sys
           import urllib.error
+          import urllib.parse
           import urllib.request
           from datetime import datetime, timedelta, timezone
 
@@ -96,6 +98,17 @@ jobs:
             "User-Agent": "strimzi-tag-sync-workflow",
           }
 
+          def is_runtime_tag(tag_name: str):
+            if not tag_name:
+              return False
+            lower = tag_name.lower()
+            if lower.startswith("sha256-"):
+              return False
+            non_runtime_suffixes = (".sbom", ".sig", ".att", ".attestation", ".cosign")
+            if lower.endswith(non_runtime_suffixes):
+              return False
+            return True
+
           def parse_ts(value: str):
             if not value:
               return None
@@ -113,8 +126,39 @@ jobs:
               dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
 
-          tags = []
-          total_tags_seen = 0
+          registry_tags = []
+          v2_next_url = "https://quay.io/v2/strimzi/kafka/tags/list?n=100"
+          while v2_next_url:
+            req = urllib.request.Request(v2_next_url, headers=headers)
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                registry_tags.extend(payload.get("tags", []))
+                link_header = resp.headers.get("Link", "")
+            except urllib.error.HTTPError as err:
+              print(f"Registry v2 API HTTP error: {err.code}", file=sys.stderr)
+              sys.exit(1)
+            except urllib.error.URLError as err:
+              print(f"Registry v2 API network error: {err}", file=sys.stderr)
+              sys.exit(1)
+
+            next_match = re.search(r'<([^>]+)>;\s*rel="next"', link_header)
+            if next_match:
+              v2_next_url = urllib.parse.urljoin(v2_next_url, next_match.group(1))
+            else:
+              v2_next_url = None
+
+          deduped_registry_tags = []
+          seen_registry_tags = set()
+          for tag in registry_tags:
+            if tag and tag not in seen_registry_tags:
+              deduped_registry_tags.append(tag)
+              seen_registry_tags.add(tag)
+
+          runtime_tags = [tag for tag in deduped_registry_tags if is_runtime_tag(tag)]
+
+          metadata_map = {}
+          metadata_tags_seen = 0
           parseable_tags = 0
           page = 1
           has_additional = True
@@ -136,46 +180,49 @@ jobs:
               sys.exit(1)
 
             page_tags = payload.get("tags", [])
-            total_tags_seen += len(page_tags)
+            metadata_tags_seen += len(page_tags)
             for tag in page_tags:
               tag_name = tag.get("name")
               last_modified_raw = tag.get("last_modified")
               last_modified = parse_ts(last_modified_raw)
               if tag_name and last_modified:
                 parseable_tags += 1
-                tags.append(
-                  {
-                    "name": tag_name,
-                    "last_modified": last_modified,
-                    "last_modified_raw": last_modified_raw,
-                  }
-                )
+                metadata_map[tag_name] = last_modified
 
             has_additional = bool(payload.get("has_additional"))
             page += 1
 
-          tags.sort(key=lambda t: t["last_modified"], reverse=True)
-          selected = []
+          joined_tags = [
+            {"name": tag_name, "last_modified": metadata_map[tag_name]}
+            for tag_name in runtime_tags
+            if tag_name in metadata_map
+          ]
+          joined_tags.sort(key=lambda t: t["last_modified"], reverse=True)
 
           previous_dt = parse_ts(prev_timestamp)
           now = datetime.now(timezone.utc)
 
           if previous_dt is not None:
-            selected = [t for t in tags if t["last_modified"] > previous_dt]
+            selected_names = [t["name"] for t in joined_tags if t["last_modified"] > previous_dt]
           else:
-            by_count = tags[:20]
+            by_count = runtime_tags[:20]
             cutoff = now - timedelta(hours=24)
-            by_time = [t for t in tags if t["last_modified"] >= cutoff]
-            selected = by_time if len(by_time) > len(by_count) else by_count
+            by_time = [t["name"] for t in joined_tags if t["last_modified"] >= cutoff]
+            selected_names = by_time if len(by_time) > len(by_count) else by_count
 
-          selected_names = [t["name"] for t in selected]
           with open(selected_tags_file, "w", encoding="utf-8") as handle:
             for tag_name in selected_names:
               handle.write(f"{tag_name}\n")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-            out.write(f"total_tags_seen={total_tags_seen}\n")
+            out.write(f"registry_v2_tags_seen={len(deduped_registry_tags)}\n")
+            out.write(f"metadata_tags_seen={metadata_tags_seen}\n")
             out.write(f"parseable_tags={parseable_tags}\n")
+            out.write(f"runtime_eligible_tags={len(runtime_tags)}\n")
+            out.write(
+              f"filtered_out_non_runtime_tags={len(deduped_registry_tags) - len(runtime_tags)}\n"
+            )
+            out.write(f"joined_tags_with_timestamp={len(joined_tags)}\n")
             out.write(f"selected_count={len(selected_names)}\n")
             out.write(f"has_new={'true' if selected_names else 'false'}\n")
             out.write(f"first_tag={selected_names[0] if selected_names else ''}\n")
@@ -236,8 +283,12 @@ jobs:
             echo "## Nightly Strimzi Tag Sync"
             echo ""
             echo "- Previous timestamp: \`${{ steps.prepare_state.outputs.previous_timestamp || 'none' }}\`"
-            echo "- Total tags fetched: \`${{ steps.discover_tags.outputs.total_tags_seen }}\`"
+            echo "- Registry v2 tags seen: \`${{ steps.discover_tags.outputs.registry_v2_tags_seen }}\`"
+            echo "- Metadata tags seen: \`${{ steps.discover_tags.outputs.metadata_tags_seen }}\`"
             echo "- Tags with parseable timestamp: \`${{ steps.discover_tags.outputs.parseable_tags }}\`"
+            echo "- Runtime eligible tags: \`${{ steps.discover_tags.outputs.runtime_eligible_tags }}\`"
+            echo "- Filtered non-runtime tags: \`${{ steps.discover_tags.outputs.filtered_out_non_runtime_tags }}\`"
+            echo "- Joined tags with timestamp: \`${{ steps.discover_tags.outputs.joined_tags_with_timestamp }}\`"
             echo "- Selected tags: \`${{ steps.discover_tags.outputs.selected_count }}\`"
             if [ "${{ steps.discover_tags.outputs.has_new }}" = "true" ]; then
               echo "- First selected tag: \`${{ steps.discover_tags.outputs.first_tag }}\`"
