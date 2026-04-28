@@ -98,6 +98,32 @@ jobs:
             "User-Agent": "strimzi-tag-sync-workflow",
           }
 
+          token_exchange_url = (
+            "https://quay.io/v2/auth"
+            "?service=quay.io&scope=repository:strimzi/kafka:pull"
+          )
+          token_request = urllib.request.Request(token_exchange_url, headers=headers)
+          try:
+            with urllib.request.urlopen(token_request, timeout=30) as resp:
+              token_payload = json.loads(resp.read().decode("utf-8"))
+          except urllib.error.HTTPError as err:
+            print(f"Quay token exchange HTTP error: {err.code}", file=sys.stderr)
+            sys.exit(1)
+          except urllib.error.URLError as err:
+            print(f"Quay token exchange network error: {err}", file=sys.stderr)
+            sys.exit(1)
+
+          registry_token = token_payload.get("token") or token_payload.get("access_token")
+          if not registry_token:
+            print("Quay token exchange succeeded but returned no token.", file=sys.stderr)
+            sys.exit(1)
+
+          v2_headers = {
+            "Authorization": f"Bearer {registry_token}",
+            "Accept": "application/json",
+            "User-Agent": "strimzi-tag-sync-workflow",
+          }
+
           def is_runtime_tag(tag_name: str):
             if not tag_name:
               return False
@@ -129,7 +155,7 @@ jobs:
           registry_tags = []
           v2_next_url = "https://quay.io/v2/strimzi/kafka/tags/list?n=100"
           while v2_next_url:
-            req = urllib.request.Request(v2_next_url, headers=headers)
+            req = urllib.request.Request(v2_next_url, headers=v2_headers)
             try:
               with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
