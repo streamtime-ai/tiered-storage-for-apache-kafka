@@ -1,0 +1,244 @@
+name: Nightly Strimzi Tag Sync
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  STATE_BRANCH: strimzi-tag-sync-state
+  STATE_FILE: .github/state/strimzi-kafka-last-run.txt
+  TARGET_IMAGE: ghcr.io/${{ github.repository_owner }}/strimzi-kafka-tiered-storage
+
+jobs:
+  sync-strimzi-tags:
+    name: Sync new Strimzi tags to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare state repository
+        id: prepare_state
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          STATE_REPO_DIR="${RUNNER_TEMP}/strimzi-state-repo"
+          rm -rf "${STATE_REPO_DIR}"
+          mkdir -p "${STATE_REPO_DIR}"
+          cd "${STATE_REPO_DIR}"
+
+          git init
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin "${STATE_BRANCH}" > /dev/null; then
+            git fetch --depth=1 origin "${STATE_BRANCH}"
+            git checkout -b "${STATE_BRANCH}" FETCH_HEAD
+            branch_exists=true
+          else
+            git checkout --orphan "${STATE_BRANCH}"
+            branch_exists=false
+          fi
+
+          previous_timestamp=""
+          if [ -f "${STATE_FILE}" ]; then
+            previous_timestamp="$(tr -d '[:space:]' < "${STATE_FILE}")"
+          fi
+
+          echo "state_repo_dir=${STATE_REPO_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "branch_exists=${branch_exists}" >> "${GITHUB_OUTPUT}"
+          echo "previous_timestamp=${previous_timestamp}" >> "${GITHUB_OUTPUT}"
+
+      - name: Discover new Quay tags
+        id: discover_tags
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+          PREVIOUS_TIMESTAMP: ${{ steps.prepare_state.outputs.previous_timestamp }}
+        run: |
+          set -euo pipefail
+
+          SELECTED_TAGS_FILE="${RUNNER_TEMP}/selected-strimzi-tags.txt"
+          : > "${SELECTED_TAGS_FILE}"
+          echo "selected_tags_file=${SELECTED_TAGS_FILE}" >> "${GITHUB_OUTPUT}"
+
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          quay_user = os.environ.get("QUAY_USERNAME", "")
+          quay_token = os.environ.get("QUAY_TOKEN", "")
+          prev_timestamp = os.environ.get("PREVIOUS_TIMESTAMP", "").strip()
+          selected_tags_file = os.path.join(os.environ["RUNNER_TEMP"], "selected-strimzi-tags.txt")
+
+          if not quay_user or not quay_token:
+            print("QUAY_USERNAME and QUAY_TOKEN must be set.", file=sys.stderr)
+            sys.exit(1)
+
+          auth = base64.b64encode(f"{quay_user}:{quay_token}".encode("utf-8")).decode("ascii")
+          headers = {
+            "Authorization": f"Basic {auth}",
+            "Accept": "application/json",
+            "User-Agent": "strimzi-tag-sync-workflow",
+          }
+
+          def parse_ts(value: str):
+            if not value:
+              return None
+            v = value.strip()
+            if v.endswith("Z"):
+              v = v[:-1] + "+00:00"
+            try:
+              dt = datetime.fromisoformat(v)
+            except ValueError:
+              return None
+            if dt.tzinfo is None:
+              dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+          tags = []
+          page = 1
+          has_additional = True
+
+          while has_additional:
+            url = (
+              "https://quay.io/api/v1/repository/strimzi/kafka/tag/"
+              f"?onlyActiveTags=true&limit=100&page={page}"
+            )
+            req = urllib.request.Request(url, headers=headers)
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as err:
+              print(f"Quay API HTTP error: {err.code}", file=sys.stderr)
+              sys.exit(1)
+            except urllib.error.URLError as err:
+              print(f"Quay API network error: {err}", file=sys.stderr)
+              sys.exit(1)
+
+            page_tags = payload.get("tags", [])
+            for tag in page_tags:
+              tag_name = tag.get("name")
+              last_modified_raw = tag.get("last_modified")
+              last_modified = parse_ts(last_modified_raw)
+              if tag_name and last_modified:
+                tags.append(
+                  {
+                    "name": tag_name,
+                    "last_modified": last_modified,
+                    "last_modified_raw": last_modified_raw,
+                  }
+                )
+
+            has_additional = bool(payload.get("has_additional"))
+            page += 1
+
+          tags.sort(key=lambda t: t["last_modified"], reverse=True)
+          selected = []
+
+          previous_dt = parse_ts(prev_timestamp)
+          now = datetime.now(timezone.utc)
+
+          if previous_dt is not None:
+            selected = [t for t in tags if t["last_modified"] > previous_dt]
+          else:
+            by_count = tags[:20]
+            cutoff = now - timedelta(hours=24)
+            by_time = [t for t in tags if t["last_modified"] >= cutoff]
+            selected = by_time if len(by_time) > len(by_count) else by_count
+
+          selected_names = [t["name"] for t in selected]
+          with open(selected_tags_file, "w", encoding="utf-8") as handle:
+            for tag_name in selected_names:
+              handle.write(f"{tag_name}\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"selected_count={len(selected_names)}\n")
+            out.write(f"has_new={'true' if selected_names else 'false'}\n")
+            out.write(f"first_tag={selected_names[0] if selected_names else ''}\n")
+            out.write(f"last_tag={selected_names[-1] if selected_names else ''}\n")
+          PY
+
+      - name: Log in to Quay
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push new tags
+        if: steps.discover_tags.outputs.has_new == 'true'
+        env:
+          SELECTED_TAGS_FILE: ${{ steps.discover_tags.outputs.selected_tags_file }}
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            target_ref="${TARGET_IMAGE}:${tag}"
+            echo "Building ${target_ref} from quay.io/strimzi/kafka:${tag}"
+            docker build -f docker/Dockerfile.strimzi --build-arg "STRIMZI_TAG=${tag}" -t "${target_ref}" .
+            docker push "${target_ref}"
+          done < "${SELECTED_TAGS_FILE}"
+
+      - name: No new tags
+        if: steps.discover_tags.outputs.has_new != 'true'
+        run: echo "No new quay.io/strimzi/kafka tags found."
+
+      - name: Update state timestamp
+        env:
+          STATE_REPO_DIR: ${{ steps.prepare_state.outputs.state_repo_dir }}
+          BRANCH_EXISTS: ${{ steps.prepare_state.outputs.branch_exists }}
+        run: |
+          set -euo pipefail
+
+          cd "${STATE_REPO_DIR}"
+          mkdir -p "$(dirname "${STATE_FILE}")"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "${STATE_FILE}"
+
+          git add "${STATE_FILE}"
+          if git diff --staged --quiet; then
+            echo "State file unchanged; skipping commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update Strimzi tag sync timestamp"
+          git push origin "${STATE_BRANCH}"
+
+      - name: Workflow summary
+        run: |
+          {
+            echo "## Nightly Strimzi Tag Sync"
+            echo ""
+            echo "- Previous timestamp: \`${{ steps.prepare_state.outputs.previous_timestamp || 'none' }}\`"
+            echo "- Selected tags: \`${{ steps.discover_tags.outputs.selected_count }}\`"
+            if [ "${{ steps.discover_tags.outputs.has_new }}" = "true" ]; then
+              echo "- First selected tag: \`${{ steps.discover_tags.outputs.first_tag }}\`"
+              echo "- Last selected tag: \`${{ steps.discover_tags.outputs.last_tag }}\`"
+            else
+              echo "- No new tags found."
+            fi
+            echo "- State branch: \`${STATE_BRANCH}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
