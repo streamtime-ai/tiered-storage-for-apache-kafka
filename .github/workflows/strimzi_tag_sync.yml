@@ -72,6 +72,7 @@ jobs:
 
           python3 <<'PY'
           import base64
+          import email.utils
           import json
           import os
           import sys
@@ -99,17 +100,22 @@ jobs:
             if not value:
               return None
             v = value.strip()
-            if v.endswith("Z"):
-              v = v[:-1] + "+00:00"
+            # Quay may return timestamps in ISO-8601 or RFC-2822 format.
+            iso_candidate = v[:-1] + "+00:00" if v.endswith("Z") else v
             try:
-              dt = datetime.fromisoformat(v)
+              dt = datetime.fromisoformat(iso_candidate)
             except ValueError:
-              return None
+              try:
+                dt = email.utils.parsedate_to_datetime(v)
+              except (TypeError, ValueError):
+                return None
             if dt.tzinfo is None:
               dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
 
           tags = []
+          total_tags_seen = 0
+          parseable_tags = 0
           page = 1
           has_additional = True
 
@@ -130,11 +136,13 @@ jobs:
               sys.exit(1)
 
             page_tags = payload.get("tags", [])
+            total_tags_seen += len(page_tags)
             for tag in page_tags:
               tag_name = tag.get("name")
               last_modified_raw = tag.get("last_modified")
               last_modified = parse_ts(last_modified_raw)
               if tag_name and last_modified:
+                parseable_tags += 1
                 tags.append(
                   {
                     "name": tag_name,
@@ -166,18 +174,13 @@ jobs:
               handle.write(f"{tag_name}\n")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"total_tags_seen={total_tags_seen}\n")
+            out.write(f"parseable_tags={parseable_tags}\n")
             out.write(f"selected_count={len(selected_names)}\n")
             out.write(f"has_new={'true' if selected_names else 'false'}\n")
             out.write(f"first_tag={selected_names[0] if selected_names else ''}\n")
             out.write(f"last_tag={selected_names[-1] if selected_names else ''}\n")
           PY
-
-      - name: Log in to Quay
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -233,6 +236,8 @@ jobs:
             echo "## Nightly Strimzi Tag Sync"
             echo ""
             echo "- Previous timestamp: \`${{ steps.prepare_state.outputs.previous_timestamp || 'none' }}\`"
+            echo "- Total tags fetched: \`${{ steps.discover_tags.outputs.total_tags_seen }}\`"
+            echo "- Tags with parseable timestamp: \`${{ steps.discover_tags.outputs.parseable_tags }}\`"
             echo "- Selected tags: \`${{ steps.discover_tags.outputs.selected_count }}\`"
             if [ "${{ steps.discover_tags.outputs.has_new }}" = "true" ]; then
               echo "- First selected tag: \`${{ steps.discover_tags.outputs.first_tag }}\`"
