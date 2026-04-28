@@ -1,0 +1,28 @@
+ARG STRIMZI_TAG=latest
+
+FROM gradle:8.7.0-jdk17 AS builder
+
+WORKDIR /workspace
+
+COPY . .
+
+RUN ./gradlew --no-daemon distTar :storage:s3:distTar
+
+FROM quay.io/strimzi/kafka:${STRIMZI_TAG}
+
+COPY --from=builder /workspace/build/distributions/tiered-storage-for-apache-kafka-*.tgz /opt/tiered-storage/
+
+COPY --from=builder /workspace/storage/s3/build/distributions/s3-*.tgz /opt/tiered-storage/
+
+USER root
+
+RUN mkdir -p /opt/kafka/libs/tiered-storage-s3/core && \
+    mkdir -p /opt/kafka/libs/tiered-storage-s3/s3 && \
+    tar xf /opt/tiered-storage/tiered-storage-for-apache-kafka-*.tgz --strip-components=1 -C /opt/kafka/libs/tiered-storage-s3/core/ && \
+    tar xf /opt/tiered-storage/s3-*.tgz --strip-components=1 -C /opt/kafka/libs/tiered-storage-s3/s3/ && \
+    rm /opt/tiered-storage/tiered-storage-for-apache-kafka-*.tgz && \
+    rm /opt/tiered-storage/s3-*.tgz 
+
+USER 1001
+
+RUN mkdir /home/kafka/kafka-tiered-storage-cache
