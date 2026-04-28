@@ -124,16 +124,13 @@ jobs:
             "User-Agent": "strimzi-tag-sync-workflow",
           }
 
-          def is_runtime_tag(tag_name: str):
+          def is_allowed_strimzi_tag(tag_name: str):
             if not tag_name:
               return False
-            lower = tag_name.lower()
-            if lower.startswith("sha256-"):
-              return False
-            non_runtime_suffixes = (".sbom", ".sig", ".att", ".attestation", ".cosign")
-            if lower.endswith(non_runtime_suffixes):
-              return False
-            return True
+            return bool(
+              re.match(r"^latest-kafka-\d+\.\d+\.\d+$", tag_name)
+              or re.match(r"^\d+\.\d+\.\d+-kafka-\d+\.\d+\.\d+$", tag_name)
+            )
 
           def parse_ts(value: str):
             if not value:
@@ -181,7 +178,7 @@ jobs:
               deduped_registry_tags.append(tag)
               seen_registry_tags.add(tag)
 
-          runtime_tags = [tag for tag in deduped_registry_tags if is_runtime_tag(tag)]
+          allowed_tags = [tag for tag in deduped_registry_tags if is_allowed_strimzi_tag(tag)]
 
           metadata_map = {}
           metadata_tags_seen = 0
@@ -220,7 +217,7 @@ jobs:
 
           joined_tags = [
             {"name": tag_name, "last_modified": metadata_map[tag_name]}
-            for tag_name in runtime_tags
+            for tag_name in allowed_tags
             if tag_name in metadata_map
           ]
           joined_tags.sort(key=lambda t: t["last_modified"], reverse=True)
@@ -231,7 +228,7 @@ jobs:
           if previous_dt is not None:
             selected_names = [t["name"] for t in joined_tags if t["last_modified"] > previous_dt]
           else:
-            by_count = runtime_tags[:20]
+            by_count = allowed_tags[:20]
             cutoff = now - timedelta(hours=24)
             by_time = [t["name"] for t in joined_tags if t["last_modified"] >= cutoff]
             selected_names = by_time if len(by_time) > len(by_count) else by_count
@@ -244,9 +241,9 @@ jobs:
             out.write(f"registry_v2_tags_seen={len(deduped_registry_tags)}\n")
             out.write(f"metadata_tags_seen={metadata_tags_seen}\n")
             out.write(f"parseable_tags={parseable_tags}\n")
-            out.write(f"runtime_eligible_tags={len(runtime_tags)}\n")
+            out.write(f"strict_pattern_matched_tags={len(allowed_tags)}\n")
             out.write(
-              f"filtered_out_non_runtime_tags={len(deduped_registry_tags) - len(runtime_tags)}\n"
+              f"filtered_out_non_matching_tags={len(deduped_registry_tags) - len(allowed_tags)}\n"
             )
             out.write(f"joined_tags_with_timestamp={len(joined_tags)}\n")
             out.write(f"selected_count={len(selected_names)}\n")
@@ -312,8 +309,8 @@ jobs:
             echo "- Registry v2 tags seen: \`${{ steps.discover_tags.outputs.registry_v2_tags_seen }}\`"
             echo "- Metadata tags seen: \`${{ steps.discover_tags.outputs.metadata_tags_seen }}\`"
             echo "- Tags with parseable timestamp: \`${{ steps.discover_tags.outputs.parseable_tags }}\`"
-            echo "- Runtime eligible tags: \`${{ steps.discover_tags.outputs.runtime_eligible_tags }}\`"
-            echo "- Filtered non-runtime tags: \`${{ steps.discover_tags.outputs.filtered_out_non_runtime_tags }}\`"
+            echo "- Strict pattern matched tags: \`${{ steps.discover_tags.outputs.strict_pattern_matched_tags }}\`"
+            echo "- Filtered non-matching tags: \`${{ steps.discover_tags.outputs.filtered_out_non_matching_tags }}\`"
             echo "- Joined tags with timestamp: \`${{ steps.discover_tags.outputs.joined_tags_with_timestamp }}\`"
             echo "- Selected tags: \`${{ steps.discover_tags.outputs.selected_count }}\`"
             if [ "${{ steps.discover_tags.outputs.has_new }}" = "true" ]; then
